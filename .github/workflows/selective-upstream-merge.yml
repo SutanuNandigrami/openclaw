@@ -110,6 +110,9 @@ jobs:
         run: |
           set -euo pipefail
 
+          upstream_repo="${{ inputs.upstream_repo }}"
+          upstream_owner_repo="${upstream_repo##*/}"
+
           while read -r line; do
             pr="${line#PR:}"
             echo "Processing PR #$pr"
@@ -117,7 +120,7 @@ jobs:
             pr_url=$(gh pr create \
               --repo "$GITHUB_REPOSITORY" \
               --base main \
-              --head "${{ inputs.upstream_repo##*/ }}:pull/$pr/head" \
+              --head "${upstream_owner_repo}:pull/$pr/head" \
               --title "Merge upstream PR #$pr" \
               --body "Automated selective merge of upstream PR #$pr" \
               --fill)
