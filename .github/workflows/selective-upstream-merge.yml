@@ -58,7 +58,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          upstream="${{ inputs.upstream_repo }}"
+          upstream_raw="${{ inputs.upstream_repo }}"
+          upstream="${upstream_raw#https://github.com/}"
+          upstream="${upstream%.git}"
+
           manual="${{ inputs.pr_numbers }}"
           label="${{ inputs.required_label }}"
           authors="${{ inputs.allowed_authors }}"
@@ -95,14 +98,6 @@ jobs:
           echo "prs<<EOF" >> "$GITHUB_OUTPUT"
           cat prs.txt >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
-
-      - name: Dry-run preview
-        if: inputs.dry_run == 'true'
-        run: |
-          echo "DRY RUN MODE"
-          echo "The following PRs would be merged:"
-          echo "${{ steps.prs.outputs.prs }}"
-
       - name: Merge PRs
         if: inputs.dry_run != 'true'
         env:
