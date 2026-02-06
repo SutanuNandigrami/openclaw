@@ -25,7 +25,6 @@ on:
         default: "true"
 
   schedule:
-    # Scheduled runs are SAFE by default (dry-run enforced later)
     - cron: "0 */6 * * *"
 
 jobs:
@@ -46,86 +45,47 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh auth status
 
-      - name: Normalize & validate upstream
+      - name: Normalize upstream
         id: upstream
         run: |
           set -euo pipefail
-
-          # Prefer explicit input, else derive upstream from fork parent
           raw="${{ inputs.upstream_repo || github.event.repository.parent.full_name }}"
-
           repo="${raw#https://github.com/}"
           repo="${repo%.git}"
-
-          if [[ ! "$repo" =~ ^[^/]+/[^/]+$ ]]; then
-            echo "Invalid upstream repo: $raw"
-            exit 1
-          fi
-
+          [[ "$repo" =~ ^[^/]+/[^/]+$ ]] || exit 1
           echo "repo=$repo" >> "$GITHUB_OUTPUT"
           echo "owner=${repo%%/*}" >> "$GITHUB_OUTPUT"
 
-      - name: Sync fork with upstream
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh repo sync "$GITHUB_REPOSITORY" \
-            --source "${{ steps.upstream.outputs.repo }}" \
-            --branch "${{ github.event.repository.default_branch }}" \
-            --force
-
-      - name: Collect PR candidates
+      - name: Collect PRs
         id: prs
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-
           manual="${{ inputs.pr_numbers }}"
           label="${{ inputs.required_label }}"
           authors="${{ inputs.allowed_authors }}"
           upstream="${{ steps.upstream.outputs.repo }}"
-
           > prs.txt
 
-          # Enforce explicit intent
-          if [[ -z "$manual" && -z "$label" && -z "$authors" ]]; then
-            echo "No selection criteria provided. Exiting safely."
-            exit 0
-          fi
+          [[ -n "$manual" || -n "$label" || -n "$authors" ]] || exit 0
 
           if [[ -n "$manual" ]]; then
-            echo "$manual" \
-              | tr ',' '\n' \
-              | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
-              | grep -E '^[0-9]+$' \
-              | sed 's/^/PR:/' >> prs.txt
+            echo "$manual" | tr ',' '\n' | grep -E '^[0-9]+$' | sed 's/^/PR:/' >> prs.txt
           else
-            gh pr list \
-              --repo "$upstream" \
-              --state open \
+            gh pr list --repo "$upstream" --state open \
               --json number,labels,author,isDraft,mergeable \
             | jq -r '
                 .[]
-                | select(.isDraft == false)
-                | select(.mergeable == "MERGEABLE")
+                | select(.isDraft==false)
+                | select(.mergeable=="MERGEABLE")
                 | select(
-                    (
-                      "'"$label"'" != ""
-                      and (.labels[].name == "'"$label"'")
-                    )
+                    ("'"$label"'"!="" and (.labels[].name=="'"$label"'"))
                     or
-                    (
-                      "'"$authors"'" != ""
-                      and (.author.login | inside("'"$authors"'"))
-                    )
+                    ("'"$authors"'"!="" and (.author.login|inside("'"$authors"'")))
                   )
                 | "PR:\(.number)"
               ' >> prs.txt
-          fi
-
-          if [[ ! -s prs.txt ]]; then
-            echo "No PRs selected."
           fi
 
           echo "prs<<EOF" >> "$GITHUB_OUTPUT"
@@ -135,24 +95,24 @@ jobs:
       - name: Dry run preview
         if: inputs.dry_run == 'true' || github.event_name == 'schedule'
         run: |
-          echo "DRY RUN MODE"
-          echo "Would process:"
+          echo "DRY RUN"
           echo "${{ steps.prs.outputs.prs }}"
 
-      - name: Merge PRs
+      - name: Merge upstream PRs (squash, safe)
         if: inputs.dry_run != 'true' && github.event_name != 'schedule'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
-          owner="${{ steps.upstream.outputs.owner }}"
           upstream="${{ steps.upstream.outputs.repo }}"
           base="${{ github.event.repository.default_branch }}"
 
-          merged=()
-          skipped=()
-          failed=()
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+
+          git fetch origin "$base"
+          git checkout "$base"
 
           while read -r line; do
             [[ -z "$line" ]] && continue
@@ -160,49 +120,33 @@ jobs:
 
             echo "▶ Processing PR #$pr"
 
-            if ! gh pr view "$pr" --repo "$upstream" --json state >/dev/null 2>&1; then
-              echo "  ⏭ PR #$pr no longer exists or inaccessible"
-              skipped+=("$pr")
+            backup="backup-before-pr-$pr-$(date +%s)"
+            git branch "$backup"
+            git push origin "$backup"
+
+            if ! git fetch "https://github.com/$upstream.git" "pull/$pr/head:pr-$pr"; then
+              gh pr comment "$pr" --repo "$upstream" \
+                --body "❌ Failed to fetch commits for PR #$pr"
               continue
             fi
 
-            state=$(gh pr view "$pr" --repo "$upstream" --json state -q .state)
-            if [[ "$state" != "OPEN" ]]; then
-              echo "  ⏭ PR #$pr is not open ($state)"
-              skipped+=("$pr")
-              continue
-            fi
+            if git merge --squash "pr-$pr"; then
+              git commit -m "Squash merge upstream PR #$pr"
+              git push origin "$base"
+              git tag "upstream-pr-$pr"
+              git push origin "upstream-pr-$pr"
 
-            if gh pr list --repo "$GITHUB_REPOSITORY" --search "Merge upstream PR #$pr" | grep -q "$pr"; then
-              echo "  ⏭ PR #$pr already merged or pending in fork"
-              skipped+=("$pr")
-              continue
-            fi
-
-            echo "  ➕ Creating merge PR for #$pr"
-            if ! pr_url=$(gh pr create \
-              --repo "$GITHUB_REPOSITORY" \
-              --base "$base" \
-              --head "${owner}:pull/$pr/head" \
-              --title "Merge upstream PR #$pr" \
-              --body "Automated selective merge of upstream PR #$pr"); then
-              echo "  ❌ Failed to create PR for #$pr"
-              failed+=("$pr")
-              continue
-            fi
-
-            if gh pr merge "$pr_url" --merge --delete-branch; then
-              echo "  ✅ Merged PR #$pr"
-              merged+=("$pr")
+              gh pr comment "$pr" --repo "$upstream" \
+                --body "✅ PR #$pr merged (squashed) into fork.\nTag: upstream-pr-$pr"
             else
-              echo "  ❌ Merge failed for PR #$pr (checks / protection?)"
-              failed+=("$pr")
-            fi
-          done <<< "${{ steps.prs.outputs.prs }}"
+              git reset --hard
+              git checkout "$backup"
+              git checkout "$base"
+              git reset --hard "$backup"
+              git push origin "$base" --force-with-lease
 
-          echo ""
-          echo "========== SUMMARY =========="
-          echo "Merged : ${merged[*]:-none}"
-          echo "Skipped: ${skipped[*]:-none}"
-          echo "Failed : ${failed[*]:-none}"
-          echo "============================="
+              gh pr comment "$pr" --repo "$upstream" \
+                --body "❌ Merge conflict while processing PR #$pr. No changes applied."
+            fi
+
+          done <<< "${{ steps.prs.outputs.prs }}"
