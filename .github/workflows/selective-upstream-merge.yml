@@ -185,7 +185,7 @@ jobs:
               --base "$base" \
               --head "${owner}:pull/$pr/head" \
               --title "Merge upstream PR #$pr" \
-              --body "Automated selective merge of upstream PR #$pr" 2>/dev/null); then
+              --body "Automated selective merge of upstream PR #$pr"); then
               echo "  ❌ Failed to create PR for #$pr"
               failed+=("$pr")
               continue
