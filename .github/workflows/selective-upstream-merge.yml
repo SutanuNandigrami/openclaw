@@ -1,18 +1,21 @@
+concurrency:
+  group: selective-upstream-merge
+  cancel-in-progress: false
+
 name: Selective Upstream Merge
 
 on:
   workflow_dispatch:
     inputs:
       upstream_repo:
-        description: "Upstream repo (owner/repo)"
-        required: true
+        description: "Upstream repo (owner/repo or URL)"
+        required: false
       pr_numbers:
         description: "Comma-separated PR numbers (optional)"
         required: false
       required_label:
         description: "Only merge PRs with this label (optional)"
         required: false
-        default: "merge-to-fork"
       allowed_authors:
         description: "Comma-separated GitHub usernames (optional)"
         required: false
@@ -20,6 +23,10 @@ on:
         description: "Dry run (true = preview only)"
         required: true
         default: "true"
+
+  schedule:
+    # Scheduled runs are SAFE by default (dry-run enforced later)
+    - cron: "0 */6 * * *"
 
 jobs:
   merge:
@@ -29,12 +36,9 @@ jobs:
       pull-requests: write
 
     steps:
-      - name: Checkout (empty)
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - uses: actions/checkout@v4
 
-      - name: Install GitHub CLI
+      - name: Install tools
         run: sudo apt-get update && sudo apt-get install -y gh jq
 
       - name: Authenticate gh
@@ -42,13 +46,32 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh auth status
 
+      - name: Normalize & validate upstream
+        id: upstream
+        run: |
+          set -euo pipefail
+
+          # Prefer explicit input, else derive upstream from fork parent
+          raw="${{ inputs.upstream_repo || github.event.repository.parent.full_name }}"
+
+          repo="${raw#https://github.com/}"
+          repo="${repo%.git}"
+
+          if [[ ! "$repo" =~ ^[^/]+/[^/]+$ ]]; then
+            echo "Invalid upstream repo: $raw"
+            exit 1
+          fi
+
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+          echo "owner=${repo%%/*}" >> "$GITHUB_OUTPUT"
+
       - name: Sync fork with upstream
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh repo sync "$GITHUB_REPOSITORY" \
-            --source "${{ inputs.upstream_repo }}" \
-            --branch main \
+            --source "${{ steps.upstream.outputs.repo }}" \
+            --branch "${{ github.event.repository.default_branch }}" \
             --force
 
       - name: Collect PR candidates
@@ -58,67 +81,128 @@ jobs:
         run: |
           set -euo pipefail
 
-          upstream_raw="${{ inputs.upstream_repo }}"
-          upstream="${upstream_raw#https://github.com/}"
-          upstream="${upstream%.git}"
-
           manual="${{ inputs.pr_numbers }}"
           label="${{ inputs.required_label }}"
           authors="${{ inputs.allowed_authors }}"
+          upstream="${{ steps.upstream.outputs.repo }}"
+
+          > prs.txt
+
+          # Enforce explicit intent
+          if [[ -z "$manual" && -z "$label" && -z "$authors" ]]; then
+            echo "No selection criteria provided. Exiting safely."
+            exit 0
+          fi
 
           if [[ -n "$manual" ]]; then
-            echo "$manual" | tr ',' '\n' | sed 's/^/PR:/' > prs.txt
+            echo "$manual" \
+              | tr ',' '\n' \
+              | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+              | grep -E '^[0-9]+$' \
+              | sed 's/^/PR:/' >> prs.txt
           else
             gh pr list \
               --repo "$upstream" \
               --state open \
               --json number,labels,author,isDraft,mergeable \
-              | jq -r '
-                  .[]
-                  | select(.isDraft == false)
-                  | select(.mergeable == "MERGEABLE")
-                  | select(
-                      (
-                        "'"$label"'" == ""
-                        or (.labels[].name == "'"$label"'")
-                      )
-                      or
-                      (
-                        "'"$authors"'" != ""
-                        and (.author.login | inside("'"$authors"'"))
-                      )
+            | jq -r '
+                .[]
+                | select(.isDraft == false)
+                | select(.mergeable == "MERGEABLE")
+                | select(
+                    (
+                      "'"$label"'" != ""
+                      and (.labels[].name == "'"$label"'")
                     )
-                  | "PR:\(.number)"
-                ' > prs.txt
+                    or
+                    (
+                      "'"$authors"'" != ""
+                      and (.author.login | inside("'"$authors"'"))
+                    )
+                  )
+                | "PR:\(.number)"
+              ' >> prs.txt
           fi
 
-          echo "Selected PRs:"
-          cat prs.txt || echo "None"
+          if [[ ! -s prs.txt ]]; then
+            echo "No PRs selected."
+          fi
 
           echo "prs<<EOF" >> "$GITHUB_OUTPUT"
           cat prs.txt >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Dry run preview
+        if: inputs.dry_run == 'true' || github.event_name == 'schedule'
+        run: |
+          echo "DRY RUN MODE"
+          echo "Would process:"
+          echo "${{ steps.prs.outputs.prs }}"
+
       - name: Merge PRs
-        if: inputs.dry_run != 'true'
+        if: inputs.dry_run != 'true' && github.event_name != 'schedule'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
-          upstream_repo="${{ inputs.upstream_repo }}"
-          upstream_owner_repo="${upstream_repo##*/}"
+          owner="${{ steps.upstream.outputs.owner }}"
+          upstream="${{ steps.upstream.outputs.repo }}"
+          base="${{ github.event.repository.default_branch }}"
+
+          merged=()
+          skipped=()
+          failed=()
 
           while read -r line; do
+            [[ -z "$line" ]] && continue
             pr="${line#PR:}"
-            echo "Processing PR #$pr"
 
-            pr_url=$(gh pr create \
+            echo "▶ Processing PR #$pr"
+
+            if ! gh pr view "$pr" --repo "$upstream" --json state >/dev/null 2>&1; then
+              echo "  ⏭ PR #$pr no longer exists or inaccessible"
+              skipped+=("$pr")
+              continue
+            fi
+
+            state=$(gh pr view "$pr" --repo "$upstream" --json state -q .state)
+            if [[ "$state" != "OPEN" ]]; then
+              echo "  ⏭ PR #$pr is not open ($state)"
+              skipped+=("$pr")
+              continue
+            fi
+
+            if gh pr list --repo "$GITHUB_REPOSITORY" --search "Merge upstream PR #$pr" | grep -q "$pr"; then
+              echo "  ⏭ PR #$pr already merged or pending in fork"
+              skipped+=("$pr")
+              continue
+            fi
+
+            echo "  ➕ Creating merge PR for #$pr"
+            if ! pr_url=$(gh pr create \
               --repo "$GITHUB_REPOSITORY" \
-              --base main \
-              --head "${upstream_owner_repo}:pull/$pr/head" \
+              --base "$base" \
+              --head "${owner}:pull/$pr/head" \
               --title "Merge upstream PR #$pr" \
-              --body "Automated selective merge of upstream PR #$pr" \
-              --fill)
+              --body "Automated selective merge of upstream PR #$pr" 2>/dev/null); then
+              echo "  ❌ Failed to create PR for #$pr"
+              failed+=("$pr")
+              continue
+            fi
 
-            gh pr merge "$pr_url" --merge --delete-branch
+            if gh pr merge "$pr_url" --merge --delete-branch; then
+              echo "  ✅ Merged PR #$pr"
+              merged+=("$pr")
+            else
+              echo "  ❌ Merge failed for PR #$pr (checks / protection?)"
+              failed+=("$pr")
+            fi
           done <<< "${{ steps.prs.outputs.prs }}"
+
+          echo ""
+          echo "========== SUMMARY =========="
+          echo "Merged : ${merged[*]:-none}"
+          echo "Skipped: ${skipped[*]:-none}"
+          echo "Failed : ${failed[*]:-none}"
+          echo "============================="
