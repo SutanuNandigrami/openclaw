@@ -1,0 +1,126 @@
+name: Selective Upstream Merge
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: "Upstream repo (owner/repo)"
+        required: true
+      pr_numbers:
+        description: "Comma-separated PR numbers (optional)"
+        required: false
+      required_label:
+        description: "Only merge PRs with this label (optional)"
+        required: false
+        default: "merge-to-fork"
+      allowed_authors:
+        description: "Comma-separated GitHub usernames (optional)"
+        required: false
+      dry_run:
+        description: "Dry run (true = preview only)"
+        required: true
+        default: "true"
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout (empty)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install GitHub CLI
+        run: sudo apt-get update && sudo apt-get install -y gh jq
+
+      - name: Authenticate gh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh auth status
+
+      - name: Sync fork with upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh repo sync "$GITHUB_REPOSITORY" \
+            --source "${{ inputs.upstream_repo }}" \
+            --branch main \
+            --force
+
+      - name: Collect PR candidates
+        id: prs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          upstream="${{ inputs.upstream_repo }}"
+          manual="${{ inputs.pr_numbers }}"
+          label="${{ inputs.required_label }}"
+          authors="${{ inputs.allowed_authors }}"
+
+          if [[ -n "$manual" ]]; then
+            echo "$manual" | tr ',' '\n' | sed 's/^/PR:/' > prs.txt
+          else
+            gh pr list \
+              --repo "$upstream" \
+              --state open \
+              --json number,labels,author,isDraft,mergeable \
+              | jq -r '
+                  .[]
+                  | select(.isDraft == false)
+                  | select(.mergeable == "MERGEABLE")
+                  | select(
+                      (
+                        "'"$label"'" == ""
+                        or (.labels[].name == "'"$label"'")
+                      )
+                      or
+                      (
+                        "'"$authors"'" != ""
+                        and (.author.login | inside("'"$authors"'"))
+                      )
+                    )
+                  | "PR:\(.number)"
+                ' > prs.txt
+          fi
+
+          echo "Selected PRs:"
+          cat prs.txt || echo "None"
+
+          echo "prs<<EOF" >> "$GITHUB_OUTPUT"
+          cat prs.txt >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Dry-run preview
+        if: inputs.dry_run == 'true'
+        run: |
+          echo "DRY RUN MODE"
+          echo "The following PRs would be merged:"
+          echo "${{ steps.prs.outputs.prs }}"
+
+      - name: Merge PRs
+        if: inputs.dry_run != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          while read -r line; do
+            pr="${line#PR:}"
+            echo "Processing PR #$pr"
+
+            pr_url=$(gh pr create \
+              --repo "$GITHUB_REPOSITORY" \
+              --base main \
+              --head "${{ inputs.upstream_repo##*/ }}:pull/$pr/head" \
+              --title "Merge upstream PR #$pr" \
+              --body "Automated selective merge of upstream PR #$pr" \
+              --fill)
+
+            gh pr merge "$pr_url" --merge --delete-branch
+          done <<< "${{ steps.prs.outputs.prs }}"
