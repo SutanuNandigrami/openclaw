@@ -60,7 +60,20 @@ jobs:
           fi
 
           echo "repo=$repo" >> "$GITHUB_OUTPUT"
-          echo "owner=${repo%%/*}" >> "$GITHUB_OUTPUT"
+
+      # 🔹 NEW: always sync upstream main first
+      - name: Sync upstream main
+        if: inputs.dry_run != 'true'
+        run: |
+          set -euo pipefail
+
+          upstream="${{ steps.upstream.outputs.repo }}"
+          base="${{ github.event.repository.default_branch }}"
+
+          git fetch "https://github.com/$upstream.git" main:upstream-main
+          git checkout "$base"
+          git merge upstream-main
+          git push origin "$base"
 
       - name: Collect PRs
         id: prs
@@ -76,9 +89,11 @@ jobs:
 
           > prs.txt
 
-          # Explicit intent gate
+          # If no criteria → sync-only mode
           if [[ -z "$manual" && -z "$label" && -z "$authors" ]]; then
-            echo "No selection criteria provided. Exiting safely."
+            echo "No PR selection provided. Sync-only run."
+            echo "prs<<EOF" >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -112,10 +127,6 @@ jobs:
               ' >> prs.txt
           fi
 
-          if [[ ! -s prs.txt ]]; then
-            echo "No PRs selected."
-          fi
-
           echo "prs<<EOF" >> "$GITHUB_OUTPUT"
           cat prs.txt >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
@@ -138,9 +149,6 @@ jobs:
 
           git config user.name "github-actions"
           git config user.email "actions@github.com"
-
-          git fetch origin "$base"
-          git checkout "$base"
 
           while read -r line; do
             [[ -z "$line" ]] && continue
