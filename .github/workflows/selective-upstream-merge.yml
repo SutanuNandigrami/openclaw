@@ -49,10 +49,16 @@ jobs:
         id: upstream
         run: |
           set -euo pipefail
+
           raw="${{ inputs.upstream_repo || github.event.repository.parent.full_name }}"
           repo="${raw#https://github.com/}"
           repo="${repo%.git}"
-          [[ "$repo" =~ ^[^/]+/[^/]+$ ]] || exit 1
+
+          if [[ ! "$repo" =~ ^[^/]+/[^/]+$ ]]; then
+            echo "Invalid upstream repo: $raw"
+            exit 1
+          fi
+
           echo "repo=$repo" >> "$GITHUB_OUTPUT"
           echo "owner=${repo%%/*}" >> "$GITHUB_OUTPUT"
 
@@ -62,30 +68,52 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+
           manual="${{ inputs.pr_numbers }}"
           label="${{ inputs.required_label }}"
           authors="${{ inputs.allowed_authors }}"
           upstream="${{ steps.upstream.outputs.repo }}"
+
           > prs.txt
 
-          [[ -n "$manual" || -n "$label" || -n "$authors" ]] || exit 0
+          # Explicit intent gate
+          if [[ -z "$manual" && -z "$label" && -z "$authors" ]]; then
+            echo "No selection criteria provided. Exiting safely."
+            exit 0
+          fi
 
           if [[ -n "$manual" ]]; then
-            echo "$manual" | tr ',' '\n' | grep -E '^[0-9]+$' | sed 's/^/PR:/' >> prs.txt
+            echo "$manual" \
+              | tr ',' '\n' \
+              | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+              | grep -E '^[0-9]+$' \
+              | sed 's/^/PR:/' >> prs.txt
           else
-            gh pr list --repo "$upstream" --state open \
+            gh pr list \
+              --repo "$upstream" \
+              --state open \
               --json number,labels,author,isDraft,mergeable \
             | jq -r '
                 .[]
-                | select(.isDraft==false)
-                | select(.mergeable=="MERGEABLE")
+                | select(.isDraft == false)
+                | select(.mergeable == "MERGEABLE")
                 | select(
-                    ("'"$label"'"!="" and (.labels[].name=="'"$label"'"))
+                    (
+                      "'"$label"'" != ""
+                      and (.labels[].name == "'"$label"'")
+                    )
                     or
-                    ("'"$authors"'"!="" and (.author.login|inside("'"$authors"'")))
+                    (
+                      "'"$authors"'" != ""
+                      and (.author.login | inside("'"$authors"'"))
+                    )
                   )
                 | "PR:\(.number)"
               ' >> prs.txt
+          fi
+
+          if [[ ! -s prs.txt ]]; then
+            echo "No PRs selected."
           fi
 
           echo "prs<<EOF" >> "$GITHUB_OUTPUT"
@@ -95,7 +123,7 @@ jobs:
       - name: Dry run preview
         if: inputs.dry_run == 'true' || github.event_name == 'schedule'
         run: |
-          echo "DRY RUN"
+          echo "DRY RUN MODE"
           echo "${{ steps.prs.outputs.prs }}"
 
       - name: Merge upstream PRs (squash, safe)
@@ -126,27 +154,28 @@ jobs:
 
             if ! git fetch "https://github.com/$upstream.git" "pull/$pr/head:pr-$pr"; then
               gh pr comment "$pr" --repo "$upstream" \
-                --body "❌ Failed to fetch commits for PR #$pr"
+                --body "❌ Failed to fetch commits for PR #$pr" || true
               continue
             fi
 
-            if git merge --squash "pr-$pr"; then
+            if git merge --squash --allow-unrelated-histories "pr-$pr"; then
               git commit -m "Squash merge upstream PR #$pr"
               git push origin "$base"
-              git tag "upstream-pr-$pr"
-              git push origin "upstream-pr-$pr"
+
+              git tag "upstream-pr-$pr" || true
+              git push origin "upstream-pr-$pr" || true
 
               gh pr comment "$pr" --repo "$upstream" \
-                --body "✅ PR #$pr merged (squashed) into fork.\nTag: upstream-pr-$pr"
+                --body "✅ PR #$pr merged (squashed) into fork.\nTag: upstream-pr-$pr" || true
             else
-              git reset --hard
-              git checkout "$backup"
-              git checkout "$base"
+              echo "❌ Merge failed for PR #$pr, restoring state"
+
+              git merge --abort || true
               git reset --hard "$backup"
               git push origin "$base" --force-with-lease
 
               gh pr comment "$pr" --repo "$upstream" \
-                --body "❌ Merge conflict while processing PR #$pr. No changes applied."
+                --body "❌ Merge conflict while processing PR #$pr. No changes were applied." || true
             fi
 
           done <<< "${{ steps.prs.outputs.prs }}"
