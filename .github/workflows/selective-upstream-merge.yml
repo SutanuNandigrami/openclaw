@@ -70,10 +70,12 @@ jobs:
           upstream="${{ steps.upstream.outputs.repo }}"
           base="${{ github.event.repository.default_branch }}"
 
+          echo "🔄 Syncing upstream main from $upstream"
+
           git fetch "https://github.com/$upstream.git" main:upstream-main
           git checkout "$base"
-          git merge upstream-main
-          git push origin "$base"
+          git merge --allow-unrelated-histories upstream-main
+          git push origin "$base"           
 
       - name: Collect PRs
         id: prs
