@@ -35,7 +35,10 @@ jobs:
       pull-requests: write
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install tools
         run: sudo apt-get update && sudo apt-get install -y gh jq
@@ -45,12 +48,22 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh auth status
 
+      - name: Configure git identity  # 🔴 THIS WAS YOUR ERROR
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
       - name: Normalize upstream
         id: upstream
         run: |
           set -euo pipefail
 
-          raw="${{ inputs.upstream_repo || github.event.repository.parent.full_name }}"
+          # Default upstream is openclaw/openclaw
+          raw="${{ inputs.upstream_repo }}"
+          if [[ -z "$raw" ]]; then
+            raw="openclaw/openclaw"
+          fi
+
           repo="${raw#https://github.com/}"
           repo="${repo%.git}"
 
@@ -61,8 +74,7 @@ jobs:
 
           echo "repo=$repo" >> "$GITHUB_OUTPUT"
 
-      # 🔹 NEW: always sync upstream main first
-      - name: Sync upstream main
+      - name: Sync upstream main (ALWAYS)
         if: inputs.dry_run != 'true'
         run: |
           set -euo pipefail
@@ -75,7 +87,7 @@ jobs:
           git fetch "https://github.com/$upstream.git" main:upstream-main
           git checkout "$base"
           git merge --allow-unrelated-histories upstream-main
-          git push origin "$base"           
+          git push origin "$base"
 
       - name: Collect PRs
         id: prs
@@ -91,7 +103,7 @@ jobs:
 
           > prs.txt
 
-          # If no criteria → sync-only mode
+          # No criteria → sync-only run
           if [[ -z "$manual" && -z "$label" && -z "$authors" ]]; then
             echo "No PR selection provided. Sync-only run."
             echo "prs<<EOF" >> "$GITHUB_OUTPUT"
@@ -100,11 +112,7 @@ jobs:
           fi
 
           if [[ -n "$manual" ]]; then
-            echo "$manual" \
-              | tr ',' '\n' \
-              | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
-              | grep -E '^[0-9]+$' \
-              | sed 's/^/PR:/' >> prs.txt
+            echo "$manual" | tr ',' '\n' | grep -E '^[0-9]+$' | sed 's/^/PR:/' >> prs.txt
           else
             gh pr list \
               --repo "$upstream" \
@@ -139,7 +147,7 @@ jobs:
           echo "DRY RUN MODE"
           echo "${{ steps.prs.outputs.prs }}"
 
-      - name: Merge upstream PRs (squash, safe)
+      - name: Merge upstream PRs (squash)
         if: inputs.dry_run != 'true' && github.event_name != 'schedule'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -148,9 +156,6 @@ jobs:
 
           upstream="${{ steps.upstream.outputs.repo }}"
           base="${{ github.event.repository.default_branch }}"
-
-          git config user.name "github-actions"
-          git config user.email "actions@github.com"
 
           while read -r line; do
             [[ -z "$line" ]] && continue
@@ -187,5 +192,4 @@ jobs:
               gh pr comment "$pr" --repo "$upstream" \
                 --body "❌ Merge conflict while processing PR #$pr. No changes were applied." || true
             fi
-
           done <<< "${{ steps.prs.outputs.prs }}"
